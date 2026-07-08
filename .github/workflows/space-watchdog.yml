@@ -1,0 +1,152 @@
+name: LRC 203 Space Watchdog
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HF_SPACE_ID: lrc203/check-ambulance
+      LRC_APP_URL: https://lrc203-check-ambulance.hf.space
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      SMTP_FROM: ${{ secrets.SMTP_FROM }}
+      LRC_NOTIFY_EMAIL_TO: ${{ secrets.LRC_NOTIFY_EMAIL_TO }}
+    steps:
+      - name: Check and repair Space
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import smtplib
+          import time
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+          from email.message import EmailMessage
+
+          space_id = os.environ["HF_SPACE_ID"]
+          app_url = os.environ["LRC_APP_URL"].rstrip("/")
+          token = os.environ["HF_TOKEN"]
+          hf_api = "https://huggingface.co"
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def read_text(url, timeout=30, method="GET"):
+              req = urllib.request.Request(
+                  url,
+                  method=method,
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as response:
+                      return response.read().decode("utf-8")
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(f"HTTP {exc.code} {url}: {body[:500]}") from exc
+
+          def read_json(url, timeout=30, method="GET"):
+              return json.loads(read_text(url, timeout=timeout, method=method))
+
+          def runtime():
+              return read_json(f"{hf_api}/api/spaces/{space_id}/runtime")
+
+          def app_health():
+              manifest = read_json(f"{app_url}/api/manifest", timeout=45)
+              metadata = manifest.get("metadata") or {}
+              return {
+                  "title": metadata.get("title", ""),
+                  "questions": metadata.get("questionCount", 0),
+                  "target": (manifest.get("target") or {}).get("label", ""),
+              }
+
+          def restart_space():
+              return read_json(f"{hf_api}/api/spaces/{space_id}/restart", timeout=45, method="POST")
+
+          def send_email(subject, body):
+              host = os.getenv("SMTP_HOST")
+              user = os.getenv("SMTP_USER")
+              password = os.getenv("SMTP_PASSWORD")
+              sender = os.getenv("SMTP_FROM") or user
+              recipient = os.getenv("LRC_NOTIFY_EMAIL_TO")
+              if not host or not user or not password or not sender or not recipient:
+                  print("Email skipped because SMTP configuration is incomplete.")
+                  return
+              message = EmailMessage()
+              message["Subject"] = subject
+              message["From"] = sender
+              message["To"] = recipient
+              message.set_content(body)
+              with smtplib.SMTP(host, int(os.getenv("SMTP_PORT") or "587"), timeout=30) as smtp:
+                  smtp.starttls()
+                  smtp.login(user, password)
+                  smtp.send_message(message)
+
+          def snapshot(label, rt=None, health=None, error=""):
+              rt = rt or {}
+              return {
+                  "label": label,
+                  "time": now(),
+                  "stage": rt.get("stage", ""),
+                  "runtime_error": rt.get("errorMessage", ""),
+                  "health": health or {},
+                  "error": error,
+              }
+
+          snapshots = []
+          try:
+              before_rt = runtime()
+              before_health = app_health() if before_rt.get("stage") == "RUNNING" else {}
+              snapshots.append(snapshot("before", before_rt, before_health))
+              healthy = before_rt.get("stage") == "RUNNING" and bool(before_health.get("questions"))
+          except Exception as exc:
+              healthy = False
+              snapshots.append(snapshot("before", error=str(exc)))
+
+          if healthy:
+              print("Space healthy:", json.dumps(snapshots[-1], ensure_ascii=False))
+              raise SystemExit(0)
+
+          print("Space unhealthy; restarting.", json.dumps(snapshots[-1], ensure_ascii=False))
+          try:
+              restart_result = restart_space()
+              snapshots.append(snapshot("restart_requested", restart_result))
+          except Exception as exc:
+              snapshots.append(snapshot("restart_failed", error=str(exc)))
+
+          recovered = False
+          for attempt in range(1, 25):
+              time.sleep(10)
+              try:
+                  rt = runtime()
+                  health = app_health() if rt.get("stage") == "RUNNING" else {}
+                  snapshots.append(snapshot(f"after_{attempt}", rt, health))
+                  if rt.get("stage") == "RUNNING" and health.get("questions"):
+                      recovered = True
+                      break
+              except Exception as exc:
+                  snapshots.append(snapshot(f"after_{attempt}", error=str(exc)))
+
+          subject = "LRC 203 app recovered by watchdog" if recovered else "LRC 203 app is still down"
+          body = "\n\n".join([
+              f"App URL: {app_url}",
+              f"Space: {space_id}",
+              f"Recovered: {recovered}",
+              "Watchdog snapshots:",
+              json.dumps(snapshots, ensure_ascii=False, indent=2),
+          ])
+          send_email(subject, body)
+          print(body)
+          raise SystemExit(0 if recovered else 1)
+          PY
