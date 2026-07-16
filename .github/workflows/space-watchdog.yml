@@ -104,6 +104,89 @@ jobs:
                   "error": error,
               }
 
+          def clean_error(text):
+              compact = " ".join(str(text or "").split())
+              if not compact:
+                  return ""
+              lowered = compact.lower()
+              if "504 gateway timeout" in lowered:
+                  return "Hugging Face returned 504 Gateway Timeout."
+              if "read operation timed out" in lowered or "timed out" in lowered:
+                  return "The request timed out."
+              if len(compact) > 180:
+                  return compact[:180] + "..."
+              return compact
+
+          def event_line(item):
+              label = item.get("label", "")
+              stage = item.get("stage") or "no stage"
+              health = item.get("health") or {}
+              error = clean_error(item.get("runtime_error") or item.get("error"))
+              if label == "before":
+                  if health.get("questions"):
+                      return f"Initial check: app responded normally ({health.get('questions')} questions)."
+                  return f"Initial check: app/runtime did not respond normally. {error}".strip()
+              if label == "restart_requested":
+                  return f"Restart: request sent to Hugging Face (stage: {stage})."
+              if label == "restart_failed":
+                  return f"Restart: Hugging Face did not accept the restart request. {error}".strip()
+              if health.get("questions"):
+                  return f"Recovery check: app responded normally ({health.get('questions')} questions, stage: {stage})."
+              return f"Recovery check: still not healthy ({stage}). {error}".strip()
+
+          def format_watchdog_email(recovered, snapshots):
+              final = next((item for item in reversed(snapshots) if (item.get("health") or {}).get("questions")), {})
+              final_health = final.get("health") or {}
+              final_stage = final.get("stage") or ("RUNNING" if recovered else "unknown")
+              restart_failed = any(item.get("label") == "restart_failed" for item in snapshots)
+              restart_requested = any(item.get("label") == "restart_requested" for item in snapshots)
+
+              subject = "LRC 203 app is online again" if recovered else "Action needed: LRC 203 app may be down"
+              action = "No action needed." if recovered else "Open Hugging Face and restart the Space manually."
+              meaning = (
+                  "This looks like a temporary Hugging Face timeout. The ambulance check app is working now."
+                  if recovered and restart_failed
+                  else "The watchdog requested a restart and the app is working now."
+                  if recovered and restart_requested
+                  else "The watchdog could not confirm that the app recovered."
+              )
+              timeline = "\n".join(f"- {event_line(item)}" for item in snapshots[:8])
+              technical = "\n".join(
+                  "- "
+                  + " | ".join(
+                      part
+                      for part in [
+                          item.get("label", ""),
+                          item.get("time", ""),
+                          f"stage={item.get('stage') or 'unknown'}",
+                          clean_error(item.get("runtime_error") or item.get("error")),
+                      ]
+                      if part
+                  )
+                  for item in snapshots
+              )
+              body = "\n\n".join(
+                  [
+                      "LRC 203 App Watchdog",
+                      f"Status: {'ONLINE NOW' if recovered else 'MAY STILL BE DOWN'}",
+                      f"Action needed: {action}",
+                      f"App: {app_url}",
+                      "What happened:\n" + timeline,
+                      "Current check:\n"
+                      + "\n".join(
+                          [
+                              f"- Space stage: {final_stage}",
+                              f"- Form target: {final_health.get('target') or 'unknown'}",
+                              f"- Questions detected: {final_health.get('questions') or 'unknown'}",
+                          ]
+                      ),
+                      "Meaning:\n" + meaning,
+                      "Technical details:\n" + technical,
+                      f"Space: {space_id}",
+                  ]
+              )
+              return subject, body
+
           snapshots = []
           try:
               before_rt = runtime()
@@ -138,14 +221,7 @@ jobs:
               except Exception as exc:
                   snapshots.append(snapshot(f"after_{attempt}", error=str(exc)))
 
-          subject = "LRC 203 app recovered by watchdog" if recovered else "LRC 203 app is still down"
-          body = "\n\n".join([
-              f"App URL: {app_url}",
-              f"Space: {space_id}",
-              f"Recovered: {recovered}",
-              "Watchdog snapshots:",
-              json.dumps(snapshots, ensure_ascii=False, indent=2),
-          ])
+          subject, body = format_watchdog_email(recovered, snapshots)
           send_email(subject, body)
           print(body)
           raise SystemExit(0 if recovered else 1)
