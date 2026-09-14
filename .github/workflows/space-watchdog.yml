@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   watchdog:
@@ -226,3 +226,55 @@ jobs:
           print(body)
           raise SystemExit(0 if recovered else 1)
           PY
+      - name: Record monthly deployment health
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+
+          endpoint = f"https://api.github.com/repos/{os.environ['GH_REPO']}/contents/health/monthly.json"
+          headers = {
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+          now = datetime.now(timezone.utc)
+          month = now.strftime("%Y-%m")
+          previous = {}
+          try:
+              with urllib.request.urlopen(urllib.request.Request(endpoint, headers=headers), timeout=30) as response:
+                  previous = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          if previous:
+              record = json.loads(base64.b64decode(previous["content"]))
+              if record.get("month") == month:
+                  print("Monthly deployment health already recorded.")
+                  raise SystemExit(0)
+          try:
+              with urllib.request.urlopen(os.environ["LRC_APP_URL"] + "/api/manifest", timeout=45) as response:
+                  manifest = json.load(response)
+              health = {"reachable": True, "questions": manifest.get("metadata", {}).get("questionCount", 0)}
+          except Exception as error:
+              health = {"reachable": False, "error_type": type(error).__name__}
+          record = {"month": month, "checked_at": now.isoformat(), "health": health}
+          payload = {
+              "message": f"Record deployment health for {month}",
+              "content": base64.b64encode((json.dumps(record, indent=2) + "\n").encode()).decode(),
+          }
+          if previous:
+              payload["sha"] = previous["sha"]
+          request = urllib.request.Request(endpoint, headers=headers, data=json.dumps(payload).encode(), method="PUT")
+          with urllib.request.urlopen(request, timeout=30) as response:
+              print("Monthly deployment health recorded:", response.status)
+          PY
+
